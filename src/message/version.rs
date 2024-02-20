@@ -1,11 +1,10 @@
 use bitflags::bitflags;
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::{
-    io::{self, Cursor, Read, Write},
+    io::{self, Read, Write},
     marker::PhantomData,
     mem::size_of,
-    net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV4},
-    string::FromUtf8Error,
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     time::{SystemTime, SystemTimeError},
 };
 use thiserror::Error;
@@ -291,6 +290,7 @@ impl Serialize for Message<Version> {
 }
 
 impl Deserialize for Message<Version> {
+    #[tracing::instrument("deserialize", skip(data))]
     fn deserialize(data: &mut impl Read) -> Result<Self, DeserializationError>
     where
         Self: Sized,
@@ -312,12 +312,12 @@ impl Deserialize for Message<Version> {
             return Err(DeserializationError::InvalidPayloadSize);
         }
 
-        tracing::debug!("payload size {}", payload_length);
-
         let mut received_checksum = [0u8; 4];
         data.read_exact(&mut received_checksum)?;
 
         let mut payload = vec![0u8; payload_length];
+        // let read_bytes = data.read(&mut payload)?;
+        // tracing::debug!("read {} bytes, expected {}", read_bytes, payload_length);
         data.read_exact(&mut payload)?;
 
         let calculated_checksum = sha256_sha256(&payload);

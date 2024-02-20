@@ -1,7 +1,6 @@
 use std::io::Write;
 use std::marker::PhantomData;
 
-use byteorder::ReadBytesExt;
 use byteorder::{LittleEndian, WriteBytesExt};
 
 use crate::message::DeserializationError;
@@ -66,6 +65,7 @@ impl Serialize for Message<Verack> {
 }
 
 impl Deserialize for Message<Verack> {
+    #[tracing::instrument("deserialize", skip(data))]
     fn deserialize(data: &mut impl std::io::Read) -> Result<Self, super::DeserializationError>
     where
         Self: Sized,
@@ -82,12 +82,8 @@ impl Deserialize for Message<Verack> {
             return Err(DeserializationError::CommandMismatch);
         }
 
-        let payload_length = data.read_u32::<LittleEndian>()? as usize;
-        if payload_length != 0 {
-            return Err(DeserializationError::InvalidPayloadSize);
-        }
-
-        tracing::debug!("payload size {}", payload_length);
+        // "payload"
+        data.read_exact(&mut [0; 4])?;
 
         let mut received_checksum = [0u8; 4];
         data.read_exact(&mut received_checksum)?;
