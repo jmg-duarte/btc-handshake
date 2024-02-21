@@ -11,3 +11,11 @@ seed.bitcoin.sprovoost.nl.
 dnsseed.emzy.de.
 seed.bitcoin.wiz.biz.
 ```
+
+
+TODO: review `mod.rs`
+ - [ ] - Deserialize (method docs)
+ - [ ] - Serialize (method docs)
+ - [ ] - Message (docs)
+ - [ ] - Tests using quickcheck
+ - [ ] - Improve this README

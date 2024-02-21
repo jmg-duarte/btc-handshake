@@ -1,41 +1,19 @@
-use std::{net::SocketAddr, time::Duration};
-
 use btc_handshake::{
     message::{
-        verack::Verack, version::Version, DeserializationError, Deserialize, Message, Serialize,
+        verack::Verack,
+        version::{Services, Version},
+        BtcDeserialize, BtcSerialize, DeserializationError, Message,
     },
-    PORT_MAINNET,
+    Network, PORT_MAINNET, PROTOCOL_VERSION,
 };
-use clap::Parser;
+use clap::{builder::PossibleValue, Parser, ValueEnum};
 use futures::future::join_all;
+use std::{net::SocketAddr, time::SystemTime};
 use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{lookup_host, TcpStream},
 };
-
-#[derive(Debug, Error)]
-enum HandshakeError {
-    #[error("nonce conflict")]
-    NonceConflict,
-
-    #[error(transparent)]
-    DeserializationError(#[from] DeserializationError),
-}
-
-#[derive(Debug, Parser)]
-struct Args {
-    /// Bitcoin DNS seed domain.
-    dns_seed: String,
-
-    /// Target's TCP port.
-    #[arg(short, long, default_value_t = PORT_MAINNET)]
-    port: u16,
-
-    /// Handshake timeout, in seconds.
-    #[arg(short, long, default_value_t = 5)]
-    timeout: u64,
-}
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -46,16 +24,12 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
-    runtime.block_on(start(
-        args.dns_seed,
-        args.port,
-        Duration::from_secs(args.timeout),
-    ))
+    runtime.block_on(start(args))
 }
 
-async fn start(dns_seed: String, port: u16, timeout: Duration) -> anyhow::Result<()> {
-    tracing::info!("Resolving DNS seed: {}:{}", dns_seed, port);
-    let resolved_addresses: Vec<_> = lookup_host((dns_seed, port)).await?.collect();
+async fn start(args: Args) -> anyhow::Result<()> {
+    tracing::info!("Resolving DNS seed: {}:{}", args.dns_seed, args.port);
+    let resolved_addresses: Vec<_> = lookup_host((args.dns_seed, args.port)).await?.collect();
 
     let mut succeeded = 0;
     let mut failed = 0;
@@ -63,7 +37,7 @@ async fn start(dns_seed: String, port: u16, timeout: Duration) -> anyhow::Result
     for result in join_all(
         resolved_addresses
             .into_iter()
-            .map(|address| tokio::time::timeout(timeout, handshake(address))),
+            .map(|address| tokio::time::timeout(args.timeout, handshake(&args.network.0, address))),
     )
     .await
     .into_iter()
@@ -85,26 +59,42 @@ async fn start(dns_seed: String, port: u16, timeout: Duration) -> anyhow::Result
     Ok(())
 }
 
-async fn handshake(address: SocketAddr) -> anyhow::Result<()> {
+async fn handshake(network: &Network, address: SocketAddr) -> anyhow::Result<()> {
     let mut stream = TcpStream::connect(address).await?;
-    version_exchange(address, &mut stream).await?;
-    verack_exchange(&mut stream).await
+    version_exchange(network, address, &mut stream).await?;
+    verack_exchange(network, &mut stream).await
 }
 
 #[tracing::instrument(name = "version", skip(stream))]
-async fn version_exchange(address: SocketAddr, stream: &mut TcpStream) -> anyhow::Result<()> {
-    let version = Version::new_with_defaults(address, stream.local_addr()?, 0, false)?;
-    let sent_version = Message::new(version);
+async fn version_exchange(
+    network: &Network,
+    address: SocketAddr,
+    stream: &mut TcpStream,
+) -> anyhow::Result<()> {
+    let version = Version::new(
+        PROTOCOL_VERSION,
+        Services::NODE_NETWORK,
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_secs() as i64,
+        address,
+        stream.local_addr()?,
+        rand::random(),
+        "".to_string(),
+        0,
+        false,
+    )?;
+    let sent_version = Message::new(network, version);
     let frame = sent_version.serialize()?;
 
     stream.write_all(&frame).await?;
-    tracing::debug!("Sent {} bytes", frame.len());
+    tracing::trace!("Sent {} bytes", frame.len());
 
     let mut reader = BufReader::new(stream);
     let mut received_bytes = reader.fill_buf().await?;
     let received_n = received_bytes.len();
 
-    tracing::debug!("Received {} bytes", received_bytes.len());
+    tracing::trace!("Received {} bytes", received_bytes.len());
 
     let received_version = Message::<Version>::deserialize(&mut received_bytes)?;
 
@@ -132,11 +122,11 @@ async fn version_exchange(address: SocketAddr, stream: &mut TcpStream) -> anyhow
 /// However, people report the protocol to be fine even if the `verack` is skipped.
 /// * https://www.righto.com/2014/02/bitcoins-hard-way-using-raw-bitcoin.html
 #[tracing::instrument(name = "verack", skip(stream))]
-async fn verack_exchange(stream: &mut TcpStream) -> anyhow::Result<()> {
-    let sent_verack = Message::new(Verack);
+async fn verack_exchange(network: &Network, stream: &mut TcpStream) -> anyhow::Result<()> {
+    let sent_verack = Message::new(network, Verack);
     let frame = sent_verack.serialize()?;
     stream.write_all(&frame).await?;
-    tracing::debug!("Sent {} bytes", frame.len());
+    tracing::trace!("Sent {} bytes", frame.len());
 
     let mut reader = BufReader::new(stream);
     let mut received_bytes = reader.fill_buf().await?;
@@ -147,8 +137,64 @@ async fn verack_exchange(stream: &mut TcpStream) -> anyhow::Result<()> {
     }
 
     Message::<Verack>::deserialize(&mut received_bytes)?;
-
     reader.consume(received_n);
 
     Ok(())
+}
+
+/// Errors that may occurrs during the handshake.
+#[derive(Debug, Error)]
+enum HandshakeError {
+    #[error("nonce conflict")]
+    NonceConflict,
+
+    #[error(transparent)]
+    DeserializationError(#[from] DeserializationError),
+}
+
+/// A wrapper over `Network` as we cannot implement foreign traits on foreign types.
+#[derive(Debug, Clone)]
+struct NetworkWrapper(Network);
+
+impl ValueEnum for NetworkWrapper {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[
+            Self(Network::Mainnet),
+            Self(Network::Regnet),
+            Self(Network::Testnet3),
+            Self(Network::Signet),
+        ]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        match self.0 {
+            Network::Mainnet => Some(PossibleValue::new("mainnet")),
+            Network::Regnet => Some(PossibleValue::new("testnet")),
+            Network::Testnet3 => Some(PossibleValue::new("testnet3")),
+            Network::Signet => Some(PossibleValue::new("signet")),
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct Args {
+    /// Bitcoin DNS seed domain.
+    dns_seed: String,
+
+    /// Target's TCP port.
+    #[arg(short, long, default_value_t = PORT_MAINNET)]
+    port: u16,
+
+    /// Handshake timeout, in seconds.
+    #[arg(short, long, value_parser = parse_duration, default_value = "5")]
+    timeout: std::time::Duration,
+
+    /// Target network.
+    #[arg(short, long, value_enum, default_value_t = NetworkWrapper(Network::Mainnet))]
+    network: NetworkWrapper,
+}
+
+fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
+    let seconds = arg.parse()?;
+    Ok(std::time::Duration::from_secs(seconds))
 }

@@ -1,54 +1,30 @@
 use std::io::Write;
-use std::marker::PhantomData;
 
 use byteorder::{LittleEndian, WriteBytesExt};
 
 use crate::message::DeserializationError;
 use crate::sha256_sha256;
-use crate::START_STRING_MAINNET;
+use crate::MAGIC_BYTES_MAINNET;
 
+use super::BtcDeserialize;
+use super::BtcSerialize;
 use super::Command;
-use super::Deserialize;
 use super::Message;
-use super::Name;
-use super::Serialize;
 use super::COMMAND_MAX_LENGTH;
 
 pub struct Verack;
 
-impl Command<Verack> {
-    fn is_verack(bytes: &[u8]) -> bool {
-        if bytes.len() != COMMAND_MAX_LENGTH {
-            return false;
-        }
-
-        for (idx, c) in Self::NAME.char_indices() {
-            if bytes[idx] != (c as u8) {
-                return false;
-            }
-        }
-
-        for idx in Self::NAME.len()..COMMAND_MAX_LENGTH {
-            if bytes[idx] != 0 {
-                return false;
-            }
-        }
-
-        true
-    }
-}
-
-impl Name for Command<Verack> {
+impl Command for Verack {
     const NAME: &'static str = "verack";
 }
 
-impl Serialize for Verack {
+impl BtcSerialize for Verack {
     fn serialize(&self) -> Result<Vec<u8>, std::io::Error> {
         Ok(vec![])
     }
 }
 
-impl Serialize for Message<Verack> {
+impl BtcSerialize for Message<Verack> {
     fn serialize(&self) -> Result<Vec<u8>, std::io::Error> {
         let mut buffer = Vec::with_capacity(
             4 + /* magic */
@@ -57,14 +33,14 @@ impl Serialize for Message<Verack> {
             4, /* checksum */
         );
         buffer.write_all(&self.magic)?;
-        buffer.write_all(&self.command.serialize()?)?;
+        buffer.write_all(&Verack::command_bytes())?;
         buffer.write_u32::<LittleEndian>(0)?;
         buffer.write_all(&sha256_sha256(&[0u8; 4]))?;
         Ok(buffer)
     }
 }
 
-impl Deserialize for Message<Verack> {
+impl BtcDeserialize for Message<Verack> {
     #[tracing::instrument("deserialize", skip(data))]
     fn deserialize(data: &mut impl std::io::Read) -> Result<Self, super::DeserializationError>
     where
@@ -72,13 +48,13 @@ impl Deserialize for Message<Verack> {
     {
         let mut magic = [0u8; 4];
         data.read_exact(&mut magic)?;
-        if magic != START_STRING_MAINNET {
+        if magic != MAGIC_BYTES_MAINNET {
             return Err(DeserializationError::MagicBytesMismatch);
         }
 
         let mut command_name = [0u8; COMMAND_MAX_LENGTH];
         data.read_exact(&mut command_name)?;
-        if !Command::<Verack>::is_verack(&command_name) {
+        if !Verack::is_valid_command(&command_name) {
             return Err(DeserializationError::CommandMismatch);
         }
 
@@ -90,8 +66,38 @@ impl Deserialize for Message<Verack> {
 
         Ok(Self {
             magic,
-            command: Command::<Verack>(PhantomData),
             payload: Verack,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::message::Command;
+
+    use super::Verack;
+
+    #[test]
+    fn valid_command() {
+        let command: [u8; 12] = [
+            0x76, 0x65, 0x72, 0x61, 0x63, 0x6b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert!(Verack::is_valid_command(&command));
+    }
+
+    #[test]
+    fn invalid_command() {
+        let command: [u8; 12] = [
+            0x76, 0x64, 0x72, 0x61, 0x63, 0x6b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert!(!Verack::is_valid_command(&command));
+    }
+
+    #[test]
+    fn invalid_padding() {
+        let command: [u8; 12] = [
+            0x76, 0x65, 0x72, 0x61, 0x63, 0x6b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        ];
+        assert!(!Verack::is_valid_command(&command));
     }
 }
