@@ -1,65 +1,25 @@
+pub mod command;
 pub mod verack;
 pub mod version;
 
-use std::{io, string};
-use thiserror::Error;
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use std::io::{self, Write};
 
-use crate::Network;
+use crate::{sha256_sha256, Network};
 
-/// Command maximum length, as defined in:
-/// * https://github.com/bitcoin/bitcoin/blob/88b1229c134fa006d9a57e908ebebec944419347/src/protocol.h#L31
-pub const COMMAND_MAX_LENGTH: usize = 12;
-
-/// Serialize to a `Vec<u8>`. The resulting buffer should be sent over the network
-/// or used in the serialization of a bigger frame.
-///
-/// For example, you may implement [`BtcSerialize`] for [`version::Message<Version>`](`Message`),
-/// which will recursively call [`version::Version`] before sending the whole frame through the network.
-pub trait BtcSerialize {
-    fn serialize(&self) -> Result<Vec<u8>, io::Error>;
-}
-
-/// A possible error when deserializing bytes into a Bitcoin type defined in this crate.
-#[derive(Debug, Error)]
-pub enum DeserializationError {
-    #[error("magic bytes mismatch")]
-    MagicBytesMismatch,
-
-    #[error("command mismatch")]
-    CommandMismatch,
-
-    #[error("invalid payload size")]
-    InvalidPayloadSize,
-
-    #[error("checksum mismatch: {received} & {calculated}")]
-    ChecksumMismatch {
-        received: String,
-        calculated: String,
+use self::{
+    command::{
+        Command, DeserializationError, DeserializeBtcCommand, SerializeBtcCommand,
+        COMMAND_MAX_LENGTH,
     },
+    version::PAYLOAD_MAX_SIZE,
+};
 
-    #[error(transparent)]
-    Utf8Error(#[from] string::FromUtf8Error),
-
-    #[error(transparent)]
-    IoError(#[from] io::Error),
-}
-
-/// Deserialize from a [`io::Read`] stream.
-pub trait BtcDeserialize {
-    fn deserialize(data: &mut impl io::Read) -> Result<Self, DeserializationError>
-    where
-        Self: Sized;
-}
-
+#[derive(Clone, Debug, PartialEq, Eq)]
 /// A Bitcoin protocol message header.
-///
-/// This implementation aims to be safe by construction by enforcing:
-/// * type-safe initialization — the constructor does not allow any type to be used as a payload
-/// * type-safe serialization — only types that implement [`BtcSerialize`] will be accepted
-/// * type-safe deserialization — you cannot construct an undefined type, hence, unknown payloads will fail serialization
-pub struct Message<T: BtcSerialize> {
+pub struct Message<T: Command> {
     /// Magic value indicating message origin network, and used to seek to next message when stream state is unknown.
-    pub magic: [u8; 4],
+    pub network: Network,
 
     /// The message payload.
     pub payload: T,
@@ -67,50 +27,88 @@ pub struct Message<T: BtcSerialize> {
 
 impl<T> Message<T>
 where
-    T: BtcSerialize,
+    T: Command,
 {
-    /// Build a new (type-safe) [`Message`] using the provided [`Network`] and payload.
+    /// Build a new [`Message`] using the provided [`Network`] and payload.
     pub fn new(network: &Network, payload: T) -> Self {
         Self {
-            magic: network.magic_bytes(),
+            network: network.clone(),
             payload,
         }
     }
 }
 
-trait Command {
-    /// Command name.
-    const NAME: &'static str;
+impl<T> Message<T>
+where
+    T: Command + SerializeBtcCommand + DeserializeBtcCommand,
+{
+    /// Deserialize/parse a [`Message`].
+    pub fn deserialize(
+        data: &mut impl io::Read,
+        network: &Network,
+    ) -> Result<Self, DeserializationError>
+    where
+        Self: Sized,
+    {
+        let mut magic = [0u8; 4];
+        data.read_exact(&mut magic)?;
+        if magic != *network.magic_bytes() {
+            return Err(DeserializationError::MagicBytesMismatch);
+        }
 
-    /// Check if the provided slice of bytes is a valid command.
-    ///
-    /// To be considered a valid command:
-    /// * the slice must have length equal to 12
-    /// * the first bytes must match the [`Command::NAME`]
-    /// * the bytes following must be `0x00`
-    fn is_valid_command(bytes: &[u8]) -> bool {
-        if bytes.len() != COMMAND_MAX_LENGTH {
-            return false;
+        let mut command_name = [0u8; COMMAND_MAX_LENGTH];
+        data.read_exact(&mut command_name)?;
+        if !T::is_valid_command(&command_name) {
+            return Err(DeserializationError::CommandMismatch);
         }
-        for (idx, c) in Self::NAME.char_indices() {
-            if bytes[idx] != (c as u8) {
-                return false;
-            }
+
+        let payload_length = data.read_u32::<LittleEndian>()? as usize;
+        if payload_length > PAYLOAD_MAX_SIZE {
+            return Err(DeserializationError::InvalidPayloadSize);
         }
-        for idx in Self::NAME.len()..COMMAND_MAX_LENGTH {
-            if bytes[idx] != 0 {
-                return false;
-            }
+
+        let mut received_checksum = [0u8; 4];
+        data.read_exact(&mut received_checksum)?;
+
+        // If the payload_length == 0 there's no allocation, thus no actual read
+        // so we just perform the checksum for strictness
+        let mut payload = vec![0u8; payload_length];
+        data.read_exact(&mut payload)?;
+
+        let calculated_checksum = sha256_sha256(&payload);
+
+        if received_checksum != calculated_checksum {
+            return Err(DeserializationError::ChecksumMismatch {
+                received: format!("{:#x}", i32::from_ne_bytes(received_checksum)),
+                calculated: format!("{:#x}", i32::from_ne_bytes(calculated_checksum)),
+            });
         }
-        true
+
+        Ok(Self {
+            network: network.clone(),
+            payload: T::deserialize(&mut payload.as_slice())?,
+        })
     }
 
-    /// Get the byte payload for the this command.
-    fn command_bytes() -> [u8; 12] {
-        let mut buffer = [0u8; COMMAND_MAX_LENGTH];
-        for (i, c) in Self::NAME.char_indices() {
-            buffer[i] = c as u8;
+    /// Serialize a [`Message`].
+    pub fn serialize(&self) -> Result<Vec<u8>, io::Error> {
+        let payload = self.payload.serialize()?;
+        let checksum = sha256_sha256(&payload);
+
+        let mut buffer = Vec::with_capacity(
+            4 + /* magic */
+            COMMAND_MAX_LENGTH +
+            4 + /* length */
+            4 + /* checksum */
+            payload.len(),
+        );
+        buffer.write_all(self.network.magic_bytes())?;
+        buffer.write_all(&T::command_bytes())?;
+        buffer.write_u32::<LittleEndian>(payload.len() as u32)?;
+        buffer.write_all(&checksum)?;
+        if payload.len() != 0 {
+            buffer.write_all(&payload)?;
         }
-        buffer
+        Ok(buffer)
     }
 }

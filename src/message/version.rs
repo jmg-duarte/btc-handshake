@@ -9,16 +9,20 @@ use std::{
 use thiserror::Error;
 
 use crate::{
-    message::{BtcDeserialize, BtcSerialize, DeserializationError},
-    sha256_sha256, MAGIC_BYTES_MAINNET, MAX_USER_AGENT_LENGTH,
+    message::{DeserializationError, DeserializeBtcCommand, SerializeBtcCommand},
+    sha256_sha256,
 };
 
 use super::{Command, Message, COMMAND_MAX_LENGTH};
+
+/// User Agent's string maximum length.
+pub const MAX_USER_AGENT_LENGTH: usize = 256;
 
 /// Maximum payload size, as defined in:
 /// * https://github.com/bitcoin/bitcoin/blob/60abd463ac2eaa8bc1d616d8c07880dc53d97211/src/serialize.h#L23
 pub const PAYLOAD_MAX_SIZE: usize = 0x02000000;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {
     /// Identifies protocol version being used by the node.
     pub version: i32,
@@ -30,19 +34,19 @@ pub struct Version {
     pub timestamp: i64,
 
     /// The network address of the node receiving this message.
-    pub addr_recv: SocketAddr,
+    pub addr_recv: NetworkAddress,
 
     /// Field is ignored (according to the docs at https://en.bitcoin.it/wiki/Protocol_documentation#version).
     ///
     /// This used to be the network address of the node emitting this message, but most P2P implementations send 26 dummy bytes.
     /// The "services" field of the address would also be redundant with the second field of the version message.
-    pub addr_from: SocketAddr,
+    pub addr_from: NetworkAddress,
 
     /// Node random nonce, randomly generated every time a version packet is sent. This nonce is used to detect connections to self.
     pub nonce: u64,
 
     /// Node user agent. See [BIP 0014](https://github.com/bitcoin/bips/blob/master/bip-0014.mediawiki).
-    pub user_agent: String,
+    pub user_agent: Vec<u8>,
 
     /// The last block received by the emitting node .
     pub start_height: i32,
@@ -71,17 +75,17 @@ impl Version {
             version,
             services,
             timestamp,
-            addr_recv,
-            addr_from,
+            addr_recv: NetworkAddress::from_socket_addr(addr_recv, services),
+            addr_from: NetworkAddress::from_socket_addr(addr_from, services),
             nonce,
-            user_agent,
+            user_agent: user_agent.into_bytes(),
             start_height,
             relay,
         })
     }
 }
 
-impl BtcSerialize for Version {
+impl SerializeBtcCommand for Version {
     fn serialize(&self) -> Result<Vec<u8>, io::Error> {
         // User Agent > 0 will cause a reallocation
         let mut buffer = Vec::with_capacity(
@@ -97,22 +101,18 @@ impl BtcSerialize for Version {
         buffer.write_i32::<LittleEndian>(self.version)?;
         buffer.write_u64::<LittleEndian>(self.services.bits())?;
         buffer.write_i64::<LittleEndian>(self.timestamp)?;
-        buffer.write_all(
-            &NetworkAddress::from_socket_addr(self.addr_recv, self.services).serialize()?,
-        )?;
-        buffer.write_all(
-            &NetworkAddress::from_socket_addr(self.addr_from, self.services).serialize()?,
-        )?;
+        buffer.write_all(&self.addr_recv.serialize()?)?;
+        buffer.write_all(&self.addr_from.serialize()?)?;
         buffer.write_u64::<LittleEndian>(self.nonce)?;
         buffer.write_u8(self.user_agent.len() as u8)?;
-        buffer.write_all(self.user_agent.as_bytes())?;
+        buffer.write_all(&self.user_agent)?;
         buffer.write_i32::<LittleEndian>(self.start_height)?;
         buffer.write_u8(self.relay.into())?;
         Ok(buffer)
     }
 }
 
-impl BtcDeserialize for Version {
+impl DeserializeBtcCommand for Version {
     fn deserialize(data: &mut impl Read) -> Result<Self, DeserializationError>
     where
         Self: Sized,
@@ -126,7 +126,6 @@ impl BtcDeserialize for Version {
         let user_agent_length = data.read_u8()? as usize;
         let mut user_agent = vec![0u8; user_agent_length];
         data.read_exact(&mut user_agent)?;
-        let user_agent = String::from_utf8(user_agent)?;
         let start_height = data.read_i32::<LittleEndian>()?;
         let relay = data.read_u8()? != 0;
         Ok(Self {
@@ -147,7 +146,7 @@ impl Command for Version {
     const NAME: &'static str = "version";
 }
 
-impl BtcSerialize for Message<Version> {
+impl SerializeBtcCommand for Message<Version> {
     fn serialize(&self) -> Result<Vec<u8>, io::Error> {
         let payload = self.payload.serialize()?;
         let checksum = sha256_sha256(&payload);
@@ -159,7 +158,7 @@ impl BtcSerialize for Message<Version> {
             4 + /* checksum */
             payload.len(),
         );
-        buffer.write_all(&self.magic)?;
+        buffer.write_all(self.network.magic_bytes())?;
         buffer.write_all(&Version::command_bytes())?;
         buffer.write_u32::<LittleEndian>(payload.len() as u32)?;
         buffer.write_all(&checksum)?;
@@ -168,55 +167,13 @@ impl BtcSerialize for Message<Version> {
     }
 }
 
-impl BtcDeserialize for Message<Version> {
-    #[tracing::instrument("deserialize", skip(data))]
-    fn deserialize(data: &mut impl Read) -> Result<Self, DeserializationError>
-    where
-        Self: Sized,
-    {
-        let mut magic = [0u8; 4];
-        data.read_exact(&mut magic)?;
-        if magic != MAGIC_BYTES_MAINNET {
-            return Err(DeserializationError::MagicBytesMismatch);
-        }
-
-        let mut command_name = [0u8; COMMAND_MAX_LENGTH];
-        data.read_exact(&mut command_name)?;
-        if !Version::is_valid_command(&command_name) {
-            return Err(DeserializationError::CommandMismatch);
-        }
-
-        let payload_length = data.read_u32::<LittleEndian>()? as usize;
-        if payload_length > PAYLOAD_MAX_SIZE {
-            return Err(DeserializationError::InvalidPayloadSize);
-        }
-
-        let mut received_checksum = [0u8; 4];
-        data.read_exact(&mut received_checksum)?;
-
-        let mut payload = vec![0u8; payload_length];
-        data.read_exact(&mut payload)?;
-
-        let calculated_checksum = sha256_sha256(&payload);
-
-        if received_checksum != calculated_checksum {
-            return Err(DeserializationError::ChecksumMismatch {
-                received: format!("{:#x}", i32::from_ne_bytes(received_checksum)),
-                calculated: format!("{:#x}", i32::from_ne_bytes(calculated_checksum)),
-            });
-        }
-
-        let payload = Version::deserialize(&mut payload.as_slice())?;
-
-        Ok(Self { magic, payload })
-    }
-}
-
 /// Network Address representation, closer to the one described in:
 /// * https://en.bitcoin.it/wiki/Protocol_documentation#Network_address
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkAddress {
     services: Services,
-    ip: IpAddr,
+    // Use Ipv6Addr instead of IpAddr because its closer to the docs and to avoid confusion when roundtripping
+    ip: Ipv6Addr,
     port: u16,
 }
 
@@ -225,37 +182,35 @@ impl NetworkAddress {
     fn from_socket_addr(addr: SocketAddr, services: Services) -> Self {
         Self {
             services,
-            ip: addr.ip(),
+            ip: {
+                match addr.ip() {
+                    IpAddr::V4(ip) => ip.to_ipv6_mapped(),
+                    IpAddr::V6(ip) => ip,
+                }
+            },
             port: addr.port(),
         }
     }
 }
 
-impl BtcSerialize for NetworkAddress {
+impl SerializeBtcCommand for NetworkAddress {
     fn serialize(&self) -> Result<Vec<u8>, io::Error> {
         let mut buffer =
             Vec::with_capacity(size_of::<Services>() + 16 /* 16 * u8 */ + 2 /* u16 */);
         buffer.write_u64::<LittleEndian>(self.services.bits())?;
-        // NOTE: hoping that RFC 1700 is enforced
-        // https://www.rfc-editor.org/rfc/rfc1700
-        match self.ip {
-            IpAddr::V4(ip) => {
-                buffer.write_u128::<BigEndian>(u128::from_ne_bytes(ip.to_ipv6_mapped().octets()))?
-            }
-            IpAddr::V6(ip) => buffer.write_u128::<BigEndian>(u128::from_ne_bytes(ip.octets()))?,
-        };
-        buffer.write_u16::<LittleEndian>(self.port)?;
+        buffer.write_u128::<BigEndian>(u128::from_be_bytes(self.ip.octets()))?;
+        buffer.write_u16::<BigEndian>(self.port)?;
         Ok(buffer)
     }
 }
 
-impl BtcDeserialize for NetworkAddress {
+impl DeserializeBtcCommand for NetworkAddress {
     fn deserialize(data: &mut impl Read) -> Result<Self, DeserializationError>
     where
         Self: Sized,
     {
         let services = Services::from_bits_truncate(data.read_u64::<LittleEndian>()?);
-        let ip = IpAddr::V6(Ipv6Addr::from(data.read_u128::<BigEndian>()?));
+        let ip = Ipv6Addr::from(data.read_u128::<BigEndian>()?);
         let port = data.read_u16::<BigEndian>()?;
         Ok(Self { services, ip, port })
     }
@@ -263,10 +218,7 @@ impl BtcDeserialize for NetworkAddress {
 
 impl From<NetworkAddress> for SocketAddr {
     fn from(value: NetworkAddress) -> Self {
-        match value.ip {
-            IpAddr::V4(ip) => SocketAddr::new(ip.into(), value.port),
-            IpAddr::V6(ip) => SocketAddr::new(ip.into(), value.port),
-        }
+        SocketAddr::new(value.ip.into(), value.port)
     }
 }
 
@@ -284,7 +236,7 @@ bitflags! {
     /// The assigned service bits, as defined in:
     /// * https://github.com/bitcoin/bitcoin/blob/88b1229c134fa006d9a57e908ebebec944419347/src/protocol.h#L274-L304
     /// * https://en.bitcoin.it/wiki/Protocol_documentation#version
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Services: u64 {
         const NODE_NETWORK = 1;
         const NODE_GETUTXO = 2;
@@ -298,9 +250,20 @@ bitflags! {
 
 #[cfg(test)]
 mod tests {
-    use crate::message::Command;
+    use std::net::Ipv6Addr;
 
-    use super::Version;
+    use quickcheck::{Arbitrary, Gen, TestResult};
+    use quickcheck_macros::quickcheck;
+
+    use crate::{
+        message::{
+            command::{DeserializeBtcCommand, SerializeBtcCommand},
+            Command, Message,
+        },
+        Network, PROTOCOL_VERSION,
+    };
+
+    use super::{NetworkAddress, Services, Version, MAX_USER_AGENT_LENGTH};
 
     #[test]
     fn valid_command() {
@@ -324,5 +287,104 @@ mod tests {
             0x76, 0x64, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x01, 0x00, 0x00,
         ];
         assert!(!Version::is_valid_command(&command));
+    }
+
+    impl Arbitrary for Services {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            Services::from_bits_truncate(u64::arbitrary(g))
+        }
+    }
+
+    impl Arbitrary for NetworkAddress {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            NetworkAddress {
+                services: Services::arbitrary(g),
+                ip: Ipv6Addr::new(
+                    u16::arbitrary(g),
+                    u16::arbitrary(g),
+                    u16::arbitrary(g),
+                    u16::arbitrary(g),
+                    u16::arbitrary(g),
+                    u16::arbitrary(g),
+                    u16::arbitrary(g),
+                    u16::arbitrary(g),
+                ),
+                port: u16::arbitrary(g),
+            }
+        }
+    }
+
+    #[quickcheck]
+    fn fuzz_network_address_roundtrip(network_address: NetworkAddress) -> TestResult {
+        let bytes = match network_address.serialize() {
+            Ok(serialized) => serialized,
+            Err(e) => return TestResult::error(e.to_string()),
+        };
+
+        let deserialized = match NetworkAddress::deserialize(&mut bytes.as_slice()) {
+            Ok(deserialized) => deserialized,
+            Err(e) => {
+                return TestResult::error(e.to_string());
+            }
+        };
+
+        TestResult::from_bool(deserialized == network_address)
+    }
+
+    impl Arbitrary for Version {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            Self {
+                version: PROTOCOL_VERSION,
+                services: Services::arbitrary(g),
+                timestamp: i64::arbitrary(g),
+                addr_recv: NetworkAddress::arbitrary(g),
+                addr_from: NetworkAddress::arbitrary(g),
+                nonce: u64::arbitrary(g),
+                user_agent: Vec::<u8>::arbitrary(&mut Gen::new(MAX_USER_AGENT_LENGTH)),
+                start_height: i32::arbitrary(g),
+                relay: bool::arbitrary(g),
+            }
+        }
+    }
+
+    #[quickcheck]
+    fn fuzz_version_roundtrip(version: Version) -> TestResult {
+        let bytes = match version.serialize() {
+            Ok(serialized) => serialized,
+            Err(e) => return TestResult::error(e.to_string()),
+        };
+
+        let deserialized = match Version::deserialize(&mut bytes.as_slice()) {
+            Ok(deserialized) => deserialized,
+            Err(e) => {
+                return TestResult::error(e.to_string());
+            }
+        };
+        TestResult::from_bool(deserialized == version)
+    }
+
+    impl Arbitrary for Message<Version> {
+        fn arbitrary(g: &mut Gen) -> Self {
+            Self {
+                network: Network::arbitrary(g),
+                payload: Version::arbitrary(g),
+            }
+        }
+    }
+
+    #[quickcheck]
+    fn fuzz_message_version_roundtrip(message: Message<Version>) -> TestResult {
+        let bytes = match message.serialize() {
+            Ok(serialized) => serialized,
+            Err(e) => return TestResult::error(e.to_string()),
+        };
+
+        let deserialized = match Message::deserialize(&mut bytes.as_slice(), &message.network) {
+            Ok(deserialized) => deserialized,
+            Err(e) => {
+                return TestResult::error(e.to_string());
+            }
+        };
+        TestResult::from_bool(deserialized == message)
     }
 }

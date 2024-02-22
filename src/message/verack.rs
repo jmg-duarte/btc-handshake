@@ -1,79 +1,40 @@
-use std::io::Write;
-
-use byteorder::{LittleEndian, WriteBytesExt};
-
 use crate::message::DeserializationError;
-use crate::sha256_sha256;
-use crate::MAGIC_BYTES_MAINNET;
 
-use super::BtcDeserialize;
-use super::BtcSerialize;
 use super::Command;
-use super::Message;
-use super::COMMAND_MAX_LENGTH;
+use super::DeserializeBtcCommand;
+use super::SerializeBtcCommand;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verack;
 
 impl Command for Verack {
     const NAME: &'static str = "verack";
 }
 
-impl BtcSerialize for Verack {
+impl SerializeBtcCommand for Verack {
     fn serialize(&self) -> Result<Vec<u8>, std::io::Error> {
         Ok(vec![])
     }
 }
 
-impl BtcSerialize for Message<Verack> {
-    fn serialize(&self) -> Result<Vec<u8>, std::io::Error> {
-        let mut buffer = Vec::with_capacity(
-            4 + /* magic */
-            COMMAND_MAX_LENGTH +
-            4 + /* length */
-            4, /* checksum */
-        );
-        buffer.write_all(&self.magic)?;
-        buffer.write_all(&Verack::command_bytes())?;
-        buffer.write_u32::<LittleEndian>(0)?;
-        buffer.write_all(&sha256_sha256(&[0u8; 4]))?;
-        Ok(buffer)
-    }
-}
-
-impl BtcDeserialize for Message<Verack> {
-    #[tracing::instrument("deserialize", skip(data))]
-    fn deserialize(data: &mut impl std::io::Read) -> Result<Self, super::DeserializationError>
+impl DeserializeBtcCommand for Verack {
+    fn deserialize(_: &mut impl std::io::Read) -> Result<Self, DeserializationError>
     where
         Self: Sized,
     {
-        let mut magic = [0u8; 4];
-        data.read_exact(&mut magic)?;
-        if magic != MAGIC_BYTES_MAINNET {
-            return Err(DeserializationError::MagicBytesMismatch);
-        }
-
-        let mut command_name = [0u8; COMMAND_MAX_LENGTH];
-        data.read_exact(&mut command_name)?;
-        if !Verack::is_valid_command(&command_name) {
-            return Err(DeserializationError::CommandMismatch);
-        }
-
-        // "payload"
-        data.read_exact(&mut [0; 4])?;
-
-        let mut received_checksum = [0u8; 4];
-        data.read_exact(&mut received_checksum)?;
-
-        Ok(Self {
-            magic,
-            payload: Verack,
-        })
+        Ok(Verack)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::message::Command;
+    use quickcheck::{Arbitrary, TestResult};
+    use quickcheck_macros::quickcheck;
+
+    use crate::{
+        message::{Command, Message},
+        Network,
+    };
 
     use super::Verack;
 
@@ -99,5 +60,30 @@ mod tests {
             0x76, 0x65, 0x72, 0x61, 0x63, 0x6b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
         ];
         assert!(!Verack::is_valid_command(&command));
+    }
+
+    impl Arbitrary for Message<Verack> {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            Self {
+                network: Network::arbitrary(g),
+                payload: Verack,
+            }
+        }
+    }
+
+    #[quickcheck]
+    fn fuzz_message_verack_roundtrip(message: Message<Verack>) -> TestResult {
+        let bytes = match message.serialize() {
+            Ok(serialized) => serialized,
+            Err(e) => return TestResult::error(e.to_string()),
+        };
+
+        let deserialized = match Message::deserialize(&mut bytes.as_slice(), &message.network) {
+            Ok(deserialized) => deserialized,
+            Err(e) => {
+                return TestResult::error(e.to_string());
+            }
+        };
+        TestResult::from_bool(deserialized == message)
     }
 }

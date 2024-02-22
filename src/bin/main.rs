@@ -1,8 +1,9 @@
 use btc_handshake::{
     message::{
+        command::DeserializationError,
         verack::Verack,
         version::{Services, Version},
-        BtcDeserialize, BtcSerialize, DeserializationError, Message,
+        Message,
     },
     Network, PORT_MAINNET, PROTOCOL_VERSION,
 };
@@ -96,7 +97,7 @@ async fn version_exchange(
 
     tracing::trace!("Received {} bytes", received_bytes.len());
 
-    let received_version = Message::<Version>::deserialize(&mut received_bytes)?;
+    let received_version = Message::<Version>::deserialize(&mut received_bytes, network)?;
 
     if sent_version.payload.nonce == received_version.payload.nonce {
         Err(HandshakeError::NonceConflict)?
@@ -136,7 +137,7 @@ async fn verack_exchange(network: &Network, stream: &mut TcpStream) -> anyhow::R
         return Ok(());
     }
 
-    Message::<Verack>::deserialize(&mut received_bytes)?;
+    Message::<Verack>::deserialize(&mut received_bytes, network)?;
     reader.consume(received_n);
 
     Ok(())

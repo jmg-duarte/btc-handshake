@@ -18,7 +18,7 @@ pub const MAGIC_BYTES_SIGNET: [u8; 4] = [0xf9, 0xbe, 0xb4, 0xfe];
 
 /// The 4 networks defined in the original Bitcoin Github repo:
 /// * https://github.com/bitcoin/bitcoin/blob/88b1229c134fa006d9a57e908ebebec944419347/test/functional/test_framework/messages.py#L77-L82
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Network {
     /// Alias for [`MAGIC_BYTES_MAINNET`].
     Mainnet,
@@ -32,12 +32,12 @@ pub enum Network {
 
 impl Network {
     /// Get the respective magic bytes.
-    const fn magic_bytes(&self) -> [u8; 4] {
+    const fn magic_bytes(&self) -> &'static [u8; 4] {
         match self {
-            Network::Mainnet => [0xf9, 0xbe, 0xb4, 0xd9],
-            Network::Regnet => [0xfa, 0xbf, 0xb5, 0xda],
-            Network::Testnet3 => [0x0b, 0x11, 0x09, 0x07],
-            Network::Signet => [0xf9, 0xbe, 0xb4, 0xfe],
+            Network::Mainnet => &MAGIC_BYTES_MAINNET,
+            Network::Regnet => &MAGIC_BYTES_REGNET,
+            Network::Testnet3 => &MAGIC_BYTES_TESTNET3,
+            Network::Signet => &MAGIC_BYTES_SIGNET,
         }
     }
 }
@@ -59,9 +59,6 @@ pub const PORT_MAINNET: u16 = 8333;
 /// The implemented protocol version.
 pub const PROTOCOL_VERSION: i32 = 70015;
 
-/// User Agent's string maximum length.
-pub const MAX_USER_AGENT_LENGTH: usize = 256;
-
 /// Message checksum size, as defined in:
 /// * https://github.com/bitcoin/bitcoin/blob/88b1229c134fa006d9a57e908ebebec944419347/src/protocol.h#L33
 pub const CHECKSUM_SIZE: usize = 4;
@@ -80,4 +77,24 @@ pub fn sha256_sha256(data: &[u8]) -> [u8; CHECKSUM_SIZE] {
     buf.clone_from_slice(&hash[..CHECKSUM_SIZE]);
 
     buf
+}
+
+#[cfg(test)]
+mod test {
+    use quickcheck::Arbitrary;
+
+    use crate::Network;
+
+    impl Arbitrary for Network {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            g.choose(&[
+                Network::Mainnet,
+                Network::Regnet,
+                Network::Signet,
+                Network::Testnet3,
+            ])
+            .unwrap()
+            .clone()
+        }
+    }
 }
