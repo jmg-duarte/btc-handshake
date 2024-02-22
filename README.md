@@ -1,7 +1,18 @@
 # Bitcoin Handshake
 
 A PoC implementation of the Bitcoin handshake, performed between two nodes.
-To simplify connecting to nodes, the implementation takes a [DNS seed](https://btcinformation.org/en/glossary/dns-seed) and gets a list of nodes to connect to.
+To simplify connecting to nodes, the implementation takes a [DNS seed](https://btcinformation.org/en/glossary/dns-seed) and gets a list of nodes to connect to and perform the handshake, as shown in the diagram below.
+
+```mermaid
+sequenceDiagram
+    btc-handshake->>DNSSeed: resolve
+    DNSSeed->>btc-handshake: peers
+    btc-handshake->>Node: version
+    Node->>btc-handshake: version
+    btc-handshake->>Node: verack
+    Node->>btc-handshake: verack
+    Node-->>btc-handshake: (other messages)
+```
 
 ## Description
 
