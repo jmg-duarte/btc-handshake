@@ -65,7 +65,7 @@ $ btc-handshake seed.bitcoin.sipa.be.
 2024-02-22T19:27:33.077506Z  INFO btc_handshake: finished with 5 SUCCESS & 20 FAILED
 ```
 
-As we can see, some clients will skip the `verack` by sending an empty buffer (marked by `server skipped verack message`).
+As we can see, some clients will skip the `verack` by sending an empty buffer (marked by `server skipped verack message`),
 other clients will ignore the `verack` and start sending other messagess straight away.
 
 ### DNS Seeds
