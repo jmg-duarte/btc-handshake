@@ -59,7 +59,11 @@ where
         let mut command_name = [0u8; COMMAND_MAX_LENGTH];
         data.read_exact(&mut command_name)?;
         if !T::is_valid_command(&command_name) {
-            return Err(DeserializationError::CommandMismatch);
+            return Err(DeserializationError::CommandMismatch {
+                expected: T::NAME.to_string(),
+                // Returning the Result since panicking in an error would be... less than ideal
+                received: String::from_utf8(command_name.to_vec()),
+            });
         }
 
         let payload_length = data.read_u32::<LittleEndian>()? as usize;

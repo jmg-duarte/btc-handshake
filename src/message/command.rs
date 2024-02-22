@@ -1,3 +1,5 @@
+use std::string::FromUtf8Error;
+
 use thiserror::Error;
 
 /// Command maximum length, as defined in:
@@ -56,8 +58,11 @@ pub enum DeserializationError {
     #[error("magic bytes mismatch")]
     MagicBytesMismatch,
 
-    #[error("command mismatch")]
-    CommandMismatch,
+    #[error("command mismatch: expected {expected} got {received:?}")]
+    CommandMismatch {
+        expected: String,
+        received: Result<String, FromUtf8Error>,
+    },
 
     #[error("invalid payload size")]
     InvalidPayloadSize,
